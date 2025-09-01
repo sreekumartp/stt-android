@@ -30,9 +30,13 @@ class MainActivity : AppCompatActivity(), RecognitionListener {
     private var model: Model? = null
     private var speechService: SpeechService? = null
 
+    private val fullTranscript = StringBuilder()
     private lateinit var button: Button
     private lateinit var transcribedText: TextView
     private lateinit var progressBar: ProgressBar
+
+    // Timestamp to throttle UI updates for partial results
+    private var lastPartialResultTime: Long = 0
 
     private val requestPermissionLauncher =
         registerForActivityResult(ActivityResultContracts.RequestPermission()) { isGranted: Boolean ->
@@ -60,7 +64,6 @@ class MainActivity : AppCompatActivity(), RecognitionListener {
                 updateUiForState(state)
             }
         }
-
         initVoskModel()
     }
 
@@ -72,49 +75,33 @@ class MainActivity : AppCompatActivity(), RecognitionListener {
                 model = Model(modelPath)
                 viewModel.onReady()
             } catch (e: IOException) {
-                Log.e("VoskInit", "Failed to initialize Vosk model", e)
                 viewModel.onError("Error: ${e.message}")
             }
         }
     }
 
-    /**
-     * The new, correct, recursive function to copy a nested asset directory.
-     */
     private suspend fun copyModelFromAssets(): String = withContext(Dispatchers.IO) {
-        val modelDir = "model-hi"
+        val modelDir = "model-hi" // Or "model-en-us"
         val appModelDir = File(filesDir, modelDir)
         if (appModelDir.exists() && appModelDir.list()?.isNotEmpty() == true) {
-            Log.d("VoskInit", "Model already exists in internal storage.")
             return@withContext appModelDir.absolutePath
         }
-
-        Log.d("VoskInit", "Model not found, copying from assets...")
-        // This is our new recursive copy function call
         copyAssetFolder(assets, modelDir, appModelDir.absolutePath)
-
-        Log.d("VoskInit", "Model copied successfully.")
         return@withContext appModelDir.absolutePath
     }
 
-    /**
-     * Recursively copies an asset folder and its contents to a destination directory.
-     */
     private fun copyAssetFolder(assetManager: AssetManager, fromAssetPath: String, toPath: String) {
         try {
             val files = assetManager.list(fromAssetPath)
             if (files.isNullOrEmpty()) {
-                // It's a file, not a folder.
                 copyAssetFile(assetManager, fromAssetPath, toPath)
             } else {
-                // It's a folder.
                 File(toPath).mkdirs()
                 for (file in files) {
                     copyAssetFolder(assetManager, "$fromAssetPath/$file", "$toPath/$file")
                 }
             }
         } catch (e: IOException) {
-            // This is thrown when list() is called on a file, so we copy the file.
             copyAssetFile(assetManager, fromAssetPath, toPath)
         }
     }
@@ -127,40 +114,38 @@ class MainActivity : AppCompatActivity(), RecognitionListener {
                 }
             }
         } catch (e: IOException) {
-            Log.e("VoskCopy", "Failed to copy asset file: $fromAssetPath", e)
+            // Log error
         }
     }
 
-
-    // --- The rest of the MainActivity is unchanged ---
-
     private fun toggleRecording() {
-        // ... same as before
         if (speechService != null) {
             stopRecording()
         } else {
-            when {
-                ContextCompat.checkSelfPermission(
-                    this,
-                    Manifest.permission.RECORD_AUDIO
-                ) == PackageManager.PERMISSION_GRANTED -> {
-                    startRecording()
-                }
-                else -> {
-                    requestPermissionLauncher.launch(Manifest.permission.RECORD_AUDIO)
-                }
+            checkPermissionAndStart()
+        }
+    }
+
+    private fun checkPermissionAndStart() {
+        when {
+            ContextCompat.checkSelfPermission(
+                this, Manifest.permission.RECORD_AUDIO
+            ) == PackageManager.PERMISSION_GRANTED -> {
+                startRecording()
+            }
+            else -> {
+                requestPermissionLauncher.launch(Manifest.permission.RECORD_AUDIO)
             }
         }
     }
 
     private fun startRecording() {
-        // ... same as before
-        val currentModel = model
-        if (currentModel == null) {
-            viewModel.onError("Model is not ready yet, please wait.")
+        val currentModel = model ?: run {
+            viewModel.onError("Model is not ready.")
             return
         }
         try {
+            fullTranscript.clear()
             val rec = Recognizer(currentModel, 16000.0f)
             speechService = SpeechService(rec, 16000.0f)
             speechService?.startListening(this)
@@ -171,7 +156,6 @@ class MainActivity : AppCompatActivity(), RecognitionListener {
     }
 
     private fun stopRecording() {
-        // ... same as before
         speechService?.stop()
         speechService?.shutdown()
         speechService = null
@@ -179,19 +163,22 @@ class MainActivity : AppCompatActivity(), RecognitionListener {
     }
 
     private fun updateUiForState(state: AppState) {
-        // ... same as before
         when (state) {
             is AppState.Loading -> {
                 button.text = "Loading Model..."
                 button.isEnabled = false
                 progressBar.visibility = ProgressBar.VISIBLE
-                transcribedText.text = "Please wait while the model is being prepared..."
+                transcribedText.text = "Please wait..."
             }
             is AppState.Ready -> {
                 button.text = "Start Recording"
                 button.isEnabled = true
                 progressBar.visibility = ProgressBar.INVISIBLE
-                transcribedText.text = "Your transcribed text will appear here..."
+                if (fullTranscript.isEmpty()) {
+                    transcribedText.text = "Your transcribed text will appear here..."
+                } else {
+                    transcribedText.text = fullTranscript.toString()
+                }
             }
             is AppState.Recording -> {
                 button.text = "Stop Recording"
@@ -199,38 +186,64 @@ class MainActivity : AppCompatActivity(), RecognitionListener {
                 progressBar.visibility = ProgressBar.INVISIBLE
                 transcribedText.text = "Listening..."
             }
-            is AppState.PartialResult -> {
-                transcribedText.text = state.text
-            }
-            is AppState.Result -> {
-                transcribedText.text = state.text
-            }
             is AppState.Error -> {
                 button.text = "Error"
                 button.isEnabled = false
                 progressBar.visibility = ProgressBar.INVISIBLE
                 transcribedText.text = state.message
             }
+            is AppState.PartialResult, is AppState.Result -> {
+                // No-op as text updates are handled directly in the listener
+            }
         }
     }
 
-    // --- RecognitionListener methods are unchanged ---
+    // --- RecognitionListener Logic ---
+
     override fun onResult(hypothesis: String) {
+        Log.d("VoskListener", "onResult: $hypothesis")
         val resultText = hypothesis.substringAfter("\"text\" : \"").substringBefore("\"")
         if (resultText.isNotBlank()) {
-            viewModel.onResult(resultText)
+            fullTranscript.append(resultText).append(" ")
+            transcribedText.text = fullTranscript.toString()
         }
     }
-    override fun onPartialResult(hypothesis: String) { /* ... */ }
-    override fun onError(e: Exception) { viewModel.onError(e.message ?: "Unknown recognition error") }
+
+    override fun onPartialResult(hypothesis: String) {
+        val currentTime = System.currentTimeMillis()
+        // Throttle updates to every 2 seconds (2000 ms)
+        if (currentTime - lastPartialResultTime < 2000) {
+            return
+        }
+        lastPartialResultTime = currentTime
+
+        Log.d("VoskListener", "onPartialResult (Throttled): $hypothesis")
+        val partialText = hypothesis.substringAfter("\"partial\" : \"").substringBefore("\"")
+        if (partialText.isNotBlank()) {
+            transcribedText.text = fullTranscript.toString() + " " + partialText
+        }
+    }
+
     override fun onFinalResult(hypothesis: String) {
+        Log.d("VoskListener", "onFinalResult: $hypothesis")
         val resultText = hypothesis.substringAfter("\"text\" : \"").substringBefore("\"")
         if (resultText.isNotBlank()) {
-            viewModel.onResult(resultText)
+            fullTranscript.append(resultText).append(" ")
+            transcribedText.text = fullTranscript.toString()
         }
+        // NOTE: We no longer call stopRecording() here to allow continuous speech.
+    }
+
+    override fun onError(e: Exception) {
+        Log.e("VoskListener", "onError: ", e)
+        viewModel.onError(e.message ?: "Unknown recognition error")
+    }
+
+    override fun onTimeout() {
+        Log.d("VoskListener", "onTimeout")
         stopRecording()
     }
-    override fun onTimeout() { stopRecording() }
+
     override fun onDestroy() {
         super.onDestroy()
         speechService?.stop()
